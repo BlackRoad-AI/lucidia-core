@@ -6,38 +6,16 @@ import ast
 import io
 import math
 import os
-import secrets
-import threading
 import re
+import secrets
 import subprocess
 import sys
-import subprocess
-import subprocess
-import sys
+import threading
 from contextlib import redirect_stdout
 from pathlib import Path
 
 import werkzeug
 from flask import Flask, jsonify, render_template, request, session
-
-# Expose a restricted set of safe built-in functions to executed code.
-SAFE_BUILTINS: dict[str, object] = {
-    "abs": abs,
-    "enumerate": enumerate,
-    "globals": globals,
-    "len": len,
-    "list": list,
-    "max": max,
-    "min": min,
-    "print": print,
-    "range": range,
-    "sum": sum,
-}
-
-# Preserve variables and functions defined per user session.
-SESSION_STATES: dict[str, dict[str, object]] = {}
-STATE_LOCK = threading.RLock()
-
 
 if not hasattr(werkzeug, "__version__"):
     try:  # pragma: no cover - compatibility shim
@@ -47,44 +25,33 @@ if not hasattr(werkzeug, "__version__"):
     else:  # pragma: no cover - executed when metadata available
         werkzeug.__version__ = getattr(_werkzeug_about, "__version__", "0")
         del _werkzeug_about
-import sympy as sp
-from flask import Flask, jsonify, render_template, request
+
+try:
+    import sympy as sp
+except ImportError:  # pragma: no cover - optional dependency
+    sp = None
 
 app = Flask(__name__)
 app.config["SECRET_KEY"] = os.environ.get("FLASK_SECRET_KEY", "lucidia-dev-secret")
 
+# Expose a restricted set of safe built-in functions to executed code.
+SAFE_BUILTINS: dict[str, object] = {
+    "print": print,
+    "abs": abs,
+    "round": round,
+    "pow": pow,
+    "enumerate": enumerate,
+    "len": len,
+    "list": list,
+    "max": max,
+    "min": min,
+    "range": range,
+    "sum": sum,
+}
 
-def _get_session_id() -> str:
-    """Return a stable session identifier for the current client."""
-
-    session_id = session.get("lucidia_session_id")
-    if session_id is None:
-        session_id = secrets.token_hex(16)
-        session["lucidia_session_id"] = session_id
-    return session_id
-
-
-def _load_session_state(session_id: str) -> dict[str, object]:
-    """Return a shallow copy of the stored session state."""
-
-    with STATE_LOCK:
-        state = SESSION_STATES.setdefault(session_id, {})
-        return dict(state)
-
-
-def _persist_session_state(session_id: str, new_state: dict[str, object]) -> None:
-    """Persist sanitized execution locals for the session."""
-
-    sanitized = {k: v for k, v in new_state.items() if k != "__builtins__"}
-    with STATE_LOCK:
-        SESSION_STATES[session_id] = sanitized
-
-
-def reset_all_session_state() -> None:
-    """Helper for tests to reset every stored session."""
-
-    with STATE_LOCK:
-        SESSION_STATES.clear()
+# Preserve variables and functions defined per user session.
+SESSION_STATES: dict[str, dict[str, object]] = {}
+STATE_LOCK = threading.RLock()
 
 
 _WORKSPACE_ENV = os.environ.get("LUCIDIA_WORKSPACE")
@@ -95,18 +62,7 @@ WORKSPACE_ROOT = (
 )
 
 
-# --- safety helpers -------------------------------------------------------
-
-# Limit the builtins available to executed user code.  Only a few
-# side-effect-free functions are exposed; anything else would raise a
-# ``NameError``.  Using a constant dictionary both documents the policy and
-# allows the validation step below to reference the allowed names.
-SAFE_BUILTINS = {"print": print, "abs": abs, "round": round, "pow": pow}
-
-
-# Only allow installing a curated set of packages.  Keys are normalized user
-# inputs, values are the canonical pinned specifiers that will be passed to
-# ``pip``.
+# Only allow installing a curated set of packages.
 ALLOWLISTED_PACKAGES = {
     "itsdangerous": "itsdangerous==2.2.0",
 }
@@ -120,9 +76,37 @@ class CodeValidationError(ValueError):
     """Raised when submitted code contains unsafe operations."""
 
 
+def _get_session_id() -> str:
+    """Return a stable session identifier for the current client."""
+    session_id = session.get("lucidia_session_id")
+    if session_id is None:
+        session_id = secrets.token_hex(16)
+        session["lucidia_session_id"] = session_id
+    return session_id
+
+
+def _load_session_state(session_id: str) -> dict[str, object]:
+    """Return a shallow copy of the stored session state."""
+    with STATE_LOCK:
+        state = SESSION_STATES.setdefault(session_id, {})
+        return dict(state)
+
+
+def _persist_session_state(session_id: str, new_state: dict[str, object]) -> None:
+    """Persist sanitized execution locals for the session."""
+    sanitized = {k: v for k, v in new_state.items() if k != "__builtins__"}
+    with STATE_LOCK:
+        SESSION_STATES[session_id] = sanitized
+
+
+def reset_all_session_state() -> None:
+    """Helper for tests to reset every stored session."""
+    with STATE_LOCK:
+        SESSION_STATES.clear()
+
+
 def _path_contains_symlink(path: Path, root: Path) -> bool:
     """Check whether ``path`` traverses any symbolic links beneath ``root``."""
-
     try:
         relative = path.relative_to(root)
     except ValueError:
@@ -136,15 +120,7 @@ def _path_contains_symlink(path: Path, root: Path) -> bool:
 
 
 def _validate(code: str) -> None:
-    """Lightweight static analysis to reject obviously unsafe code.
-
-    The checker disallows import statements and attribute access outside of
-    the ``math`` module.  It also restricts function calls to the allowed
-    builtin names or ``math`` functions.  The intent is not to provide a
-    perfect sandbox but to reduce risk from common attack vectors such as
-    importing the ``os`` module or accessing ``__subclasses__``.
-    """
-
+    """Lightweight static analysis to reject obviously unsafe code."""
     tree = ast.parse(code, mode="exec")
     for node in ast.walk(tree):
         if isinstance(node, (ast.Import, ast.ImportFrom)):
@@ -162,6 +138,8 @@ def _validate(code: str) -> None:
                     raise CodeValidationError("only calls to math functions are permitted")
 
 
+# --- routes ----------------------------------------------------------------
+
 @app.route("/")
 def index():
     """Serve the main page."""
@@ -173,34 +151,20 @@ def run_code():
     """Execute user-supplied Python code and return the output."""
     data = request.get_json(silent=True) or {}
     code = data.get("code", "")
-    session_id = _get_session_id()
-    session_state = _load_session_state(session_id)
-    exec_locals = {k: v for k, v in session_state.items() if k != "__builtins__"}
-    stdout = io.StringIO()
-    try:
-        with redirect_stdout(stdout):
-            exec(code, {"__builtins__": SAFE_BUILTINS.copy()}, exec_locals)
 
     try:
         _validate(code)
     except CodeValidationError as exc:
-        # Reject code that fails the static checks with a clear error message.
         return jsonify({"error": str(exc)}), 400
 
-    local_vars: dict[str, object] = {"math": math}
+    session_id = _get_session_id()
+    session_state = _load_session_state(session_id)
+    exec_locals: dict[str, object] = {"math": math}
+    exec_locals.update({k: v for k, v in session_state.items() if k != "__builtins__"})
     stdout = io.StringIO()
     try:
         with redirect_stdout(stdout):
-            # ``SAFE_BUILTINS`` is provided via the globals mapping, while
-            # ``local_vars`` exposes the math module.  No other globals are
-            # accessible to the executed code.
-            exec(code, {"__builtins__": SAFE_BUILTINS}, local_vars)
-    local_vars: dict[str, object] = {"math": math}
-    safe_builtins = {"print": print, "abs": abs, "round": round, "pow": pow}
-    stdout = io.StringIO()
-    try:
-        with redirect_stdout(stdout):
-            exec(code, {"__builtins__": safe_builtins}, local_vars)
+            exec(code, {"__builtins__": SAFE_BUILTINS}, exec_locals)
         output = stdout.getvalue()
     except Exception as exc:  # noqa: BLE001 - broad for user feedback
         output = f"Error: {exc}"
@@ -212,6 +176,8 @@ def run_code():
 @app.post("/math")
 def evaluate_math():
     """Evaluate a mathematical expression and optionally report its derivative."""
+    if sp is None:
+        return jsonify({"error": "sympy is not installed"}), 500
     data = request.get_json(silent=True) or {}
     expr = data.get("expression")
     if not expr:
@@ -232,7 +198,6 @@ def evaluate_math():
 @app.post("/install")
 def install_package():
     """Install an allowlisted Python package via ``pip`` within the environment."""
-    """Install a Python package via ``pip`` within the environment."""
     data = request.get_json(silent=True) or {}
     package = data.get("package")
     if not package:
@@ -260,20 +225,6 @@ def install_package():
         capture_output=True,
         text=True,
         env=pip_env,
-    proc = subprocess.run(
-        ["pip", "install", package],
-@app.post("/install")
-def install_package():
-    """Install a Python package via ``pip`` within the environment."""
-    data = request.get_json(silent=True) or {}
-    package = data.get("package")
-    if not isinstance(package, str) or not package.strip():
-        return jsonify({"error": "missing package"}), 400
-    package = package.strip()
-    proc = subprocess.run(
-        [sys.executable, "-m", "pip", "install", package],
-        capture_output=True,
-        text=True,
     )
     return (
         jsonify({"code": proc.returncode, "stdout": proc.stdout, "stderr": proc.stderr}),
@@ -295,7 +246,7 @@ def git_clean():
 
     try:
         resolved_repo = repo_path.resolve(strict=True)
-    except (OSError, RuntimeError):  # noqa: PERF203 - need broad resolution errors
+    except (OSError, RuntimeError):
         return jsonify({"error": "invalid path"}), 400
 
     try:
@@ -312,15 +263,7 @@ def git_clean():
     git_dir = resolved_repo / ".git"
     if not git_dir.is_dir():
         return jsonify({"error": "not a git repo"}), 400
-    raw_path = data.get("path", ".")
-    try:
-        repo_path = Path(raw_path).expanduser().resolve()
-    except (TypeError, RuntimeError):
-        return jsonify({"error": "invalid path"}), 400
-    if not repo_path.is_dir():
-        return jsonify({"error": "invalid path"}), 400
-    if not (repo_path / ".git").is_dir():
-        return jsonify({"error": "invalid path"}), 400
+
     reset = subprocess.run(
         ["git", "reset", "--hard"],
         cwd=resolved_repo,
